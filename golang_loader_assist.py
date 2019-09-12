@@ -1,14 +1,15 @@
 """golang_loader_assist.py: Help IDA Pro do some golang reversing."""
 
 __author__ = "Tim 'diff' Strazzere"
-__copyright__ = "Copyright 2016, Red Naga"
+__copyright__ = "Copyright 2016-2019, Red Naga"
 __license__ = "GPL"
-__version__ = "1.2"
+__version__ = "1.3"
 __email__ = ["strazz@gmail.com"]
 
 from idautils import *
 from idc import *
 import idaapi
+import ida_segment
 import sys
 import string
 
@@ -80,7 +81,7 @@ def is_string_load(addr):
         return False
 
     # Validate that the string offset actually exists inside the binary
-    if idaapi.get_segm_name(GetOperandValue(addr, 1)) is None:
+    if get_segm_name(GetOperandValue(addr, 1)) is None:
         return False
 
     # Could be unk_, asc_, 'offset ', XXXXh, ignored ones are loc_ or inside []
@@ -107,7 +108,7 @@ def is_string_load(addr):
     return False
 
 def create_string(addr, string_len):
-    if idaapi.get_segm_name(addr) is None:
+    if get_segm_name(addr) is None:
         debug('Cannot load a string which has no segment - not creating string @ 0x%02x' % addr)
         return False
 
@@ -160,8 +161,8 @@ def strings_init():
 
         while addr <= end_addr:
             if is_string_load(addr):
-                if 'rodata' not in idaapi.get_segm_name(addr) and 'text' not in idaapi.get_segm_name(addr):
-                    debug('Should a string be in the %s section?' % idaapi.get_segm_name(addr))
+                if 'rodata' not in get_segm_name(addr) and 'text' not in get_segm_name(addr):
+                    debug('Should a string be in the %s section?' % get_segm_name(addr))
                 string_addr = GetOperandValue(addr, 1)
                 addr_3 = FindCode(FindCode(addr, SEARCH_DOWN), SEARCH_DOWN)
                 string_len = GetOperandValue(addr_3, 1)
@@ -183,7 +184,7 @@ def strings_init():
             if create_offset(instr_addr):
                 strings_added += 1
         else:
-            error('Unable to make a string @ 0x%x with length of %d for usage in function @ 0x%x' % (string_addr, string_len, instr_addr))
+            error('FAILED-RETRY : Unable to make a string @ 0x%x with length of %d for usage in function @ 0x%x' % (string_addr, string_len, instr_addr))
 
     return strings_added
 
@@ -197,17 +198,30 @@ def get_text_seg():
     return _get_seg(['.text', '__text'])
 
 def get_gopclntab_seg():
-    #   .gopclntab found in PE & ELF binaries, __gopclntab found in macho binaries
-    return _get_seg(['.gopclntab', '__gopclntab'])
+    # .gopclntab found in (older) PE & ELF binaries, __gopclntab found in macho binaries,
+    # runtime.pclntab in .rdata for newer PE binaries
+    seg =  _get_seg(['.gopclntab', '__gopclntab'])
+
+    if seg is None:
+        seg = _get_seg_from_rdata(['runtime.pclntab'])
+
+    return seg
 
 def _get_seg(possible_seg_names):
-    seg = None
     for seg_name in possible_seg_names:
-        seg = idaapi.get_segm_by_name(seg_name)
+        seg = ida_segment.get_segm_by_name(seg_name)
         if seg:
             return seg
 
-    return seg
+    return None
+
+def _get_seg_from_rdata(possible_seg_names):
+    for seg_name in possible_seg_names:
+        for ea, name in Names():
+            if name == seg_name:
+                return ea
+
+    return None
 
 # Indicators of runtime_morestack
 # mov     large dword ptr ds:1003h, 0 # most I've seen
@@ -347,8 +361,14 @@ def renamer_init():
 
     gopclntab = get_gopclntab_seg()
     if gopclntab is not None:
+        info('type : %s' % type(gopclntab))
+        startEA = 0
+        if isinstance(gopclntab, long):
+            startEA = gopclntab
+        else:
+            startEA = gopclntab.startEA
         # Skip unimportant header and goto section size
-        addr = gopclntab.startEA + 8
+        addr = startEA + 8
         size, addr_size = create_pointer(addr)
         addr += addr_size
 
@@ -359,7 +379,7 @@ def renamer_init():
             name_offset, addr_size = create_pointer(addr + addr_size)
             addr += addr_size * 2
 
-            func_name_addr = Dword(name_offset + gopclntab.startEA + addr_size) + gopclntab.startEA
+            func_name_addr = Dword(name_offset + startEA + addr_size) + startEA
             func_name = GetString(func_name_addr)
             MakeStr(func_name_addr, func_name_addr + len(func_name))
             appended = clean_func_name = clean_function_name(func_name)
@@ -396,7 +416,7 @@ def pointer_renamer():
         # Look at data xrefs to the function - find the pointer that is located in .rodata
         data_ref = idaapi.get_first_dref_to(addr)
         while data_ref != BADADDR:
-            if 'rodata' in idaapi.get_segm_name(data_ref):
+            if 'rodata' in get_segm_name(data_ref):
                 # Only rename things that are currently listed as an offset; eg. off_9120B0
                 if 'off_' in GetTrueName(data_ref):
                     if MakeName(data_ref, ('%s_ptr' % name)):
